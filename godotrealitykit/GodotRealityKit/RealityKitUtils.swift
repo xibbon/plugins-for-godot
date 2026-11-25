@@ -182,11 +182,15 @@ public func hasOriginalScene() -> Bool {
 }
 
 public func startBlockingAsyncTask() {
-	MainActor.assumeIsolated{ Bridge.blockingAsyncTaskCount += 1 }
+	MainActor.assumeIsolated {
+		Bridge.startBlockingAsyncTask(sessionID: Bridge.sessionID)
+	}
 }
 
 public func stopBlockingAsyncTask() {
-	MainActor.assumeIsolated{ Bridge.blockingAsyncTaskCount -= 1 }
+	MainActor.assumeIsolated {
+		Bridge.stopBlockingAsyncTask(sessionID: Bridge.sessionID)
+	}
 }
 
 #if !os(macOS)
@@ -202,12 +206,13 @@ public func destroyOriginalScene() {
 
 @MainActor
 func withBlockingAsyncTaskScope(body: @escaping @MainActor () async -> Void) {
-	startBlockingAsyncTask()
+	let sessionID = Bridge.sessionID
+	Bridge.startBlockingAsyncTask(sessionID: sessionID)
 	
 	Task { @MainActor in
 		await body()
 		
-		stopBlockingAsyncTask()
+		Bridge.stopBlockingAsyncTask(sessionID: sessionID)
 	}
 }
 
@@ -1147,6 +1152,18 @@ public struct Entity: @unchecked Sendable {
             } else {
                 self.value.components.remove(ImageBasedLightReceiverComponent.self)
             }
+        }
+    }
+
+    public func setEnvironmentLightingWeight(_ weight: Float) {
+        MainActor.assumeIsolated {
+            self.value.components.set(EnvironmentLightingConfigurationComponent(environmentLightingWeight: weight))
+        }
+    }
+
+    public func unsetEnvironmentLightingWeight() {
+        MainActor.assumeIsolated {
+            self.value.components.remove(EnvironmentLightingConfigurationComponent.self)
         }
     }
 

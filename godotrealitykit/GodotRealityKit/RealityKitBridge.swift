@@ -136,6 +136,12 @@ extension RealityView {
     private func handleEvent(event: SpatialEventCollection.Event, value: Value, delegate: GDRKBridgeDelegate?, root: RealityKit.Entity, size: Size, ended: Bool) {
         let eventID = event.id.hashValue
 
+#if !os(macOS)
+        if event.kind != .indirectPinch {
+            return
+        }
+#endif
+
 #if os(macOS)
         let position3D: SIMD3<Float>? = nil
 #else
@@ -245,6 +251,7 @@ extension RealityView {
 class PortalRealityViewState {
     var lastViewBounds: BoundingBox? = nil
     var lastCageScale: Float? = nil
+    var lastExtraLightFrustumScale: Float? = nil
 }
 
 // Workaround for : RealityKit's RealityView does not receive
@@ -332,6 +339,23 @@ struct PortalRealityView : View {
         }
     }
 
+    private func extraLightFrustumScale() -> Float {
+        let unscaled = physicalMetrics.worldScalingCompensation(.unscaled).convert(1.0, from: .meters)
+        let scaled = physicalMetrics.worldScalingCompensation(.scaled).convert(1.0, from: .meters)
+        guard unscaled > 0, scaled > 0 else {
+            return 1.0
+        }
+        return Float(scaled / unscaled)
+    }
+
+    private func updateExtraLightFrustumScale() {
+        let scale = self.extraLightFrustumScale()
+        if state.lastExtraLightFrustumScale != scale {
+            self.delegate?.onExtraLightFrustumScaleChanged(scale)
+            state.lastExtraLightFrustumScale = scale
+        }
+    }
+
     public var body: some View {
         GeometryReader3D{ proxy in
             RealityView(make: { content in
@@ -350,6 +374,7 @@ struct PortalRealityView : View {
 
                 self.subscription = content.subscribe(to: SceneEvents.Update.self, self.onSceneUpdate)
                 self.delegate?.onWorldScaleChanged(self.worldScale)
+                self.updateExtraLightFrustumScale()
             }, update: { content in
                 let viewBounds = content.convert(proxy.frame(in: .local), from: .local, to: .scene)
                 if self.state.lastViewBounds != viewBounds {
@@ -365,6 +390,8 @@ struct PortalRealityView : View {
                 if let target = self.interactionTarget {
                     self.updateInteractionTarget(target, in: proxy)
                 }
+
+                self.updateExtraLightFrustumScale()
 
                 self.delegate?.onWindowResized(simd_float3(proxy.size.vector))
             })
@@ -1035,8 +1062,25 @@ public class Bridge {
     @MainActor static public var delegate: GDRKBridgeDelegate? = nil
     @MainActor static var root = Entity.initAndMaterialize()
 
+    @MainActor static var sessionID: UInt64 = 0
     @MainActor static var blockingAsyncTaskCount = 0
     @MainActor static var sceneVisible = false
+
+    @MainActor static func startBlockingAsyncTask(sessionID targetSessionID: UInt64) {
+        guard targetSessionID == Self.sessionID else {
+            return
+        }
+        Self.blockingAsyncTaskCount += 1
+    }
+
+    @MainActor static func stopBlockingAsyncTask(sessionID targetSessionID: UInt64) {
+        guard targetSessionID == Self.sessionID else {
+            return
+        }
+        if Self.blockingAsyncTaskCount > 0 {
+            Self.blockingAsyncTaskCount -= 1
+        }
+    }
 
     @MainActor static var presentationStyle = ScenePresentationStyle.sharedVolumetric
     @MainActor static var immersionStyle = SceneImmersionStyle.full
@@ -1067,6 +1111,9 @@ public class Bridge {
 
     public static func initialize(delegate: GDRKBridgeDelegate) {
         assumeMainActor(delegate) { delegate in
+            Self.sessionID &+= 1
+            Self.blockingAsyncTaskCount = 0
+            Self.sceneVisible = false
             Self.delegate = delegate
             _ = Self.root
 
@@ -1195,6 +1242,8 @@ public class Bridge {
     // when a host manages the Godot instances, so release everything that refers to this game.
     public static func shutdown() {
         MainActor.assumeIsolated {
+            Self.sessionID &+= 1
+            Self.blockingAsyncTaskCount = 0
             Self.sceneVisible = false
             Self.delegate = nil
             #if !os(macOS)
@@ -1437,12 +1486,19 @@ public class Bridge {
         let content: AnyView
         if host.managesGodotScenes?() ?? false {
             // The host iterates Godot; the volume's visibility gates RealitySceneTree processing.
+            let viewSessionID = Bridge.sessionID
             content = AnyView(realityView
                 .onAppear {
+                    guard Bridge.sessionID == viewSessionID else {
+                        return
+                    }
                     Bridge.sceneVisible = true
                     Bridge.logScene("app-hosted volume appeared; volume visible")
                 }
                 .onDisappear {
+                    guard Bridge.sessionID == viewSessionID else {
+                        return
+                    }
                     Bridge.sceneVisible = false
                     Bridge.logScene("app-hosted volume disappeared; volume hidden")
                 })

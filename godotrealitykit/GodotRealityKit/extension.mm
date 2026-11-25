@@ -9,12 +9,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <atomic>
 #include <cstring>
 #include <type_traits>
 
 #import "clipping_3d.h"
 #import "controller_xr_interface.h"
 #import "directional_light_shadow_3d.h"
+#import "environment_lighting_configuration.h"
 #import "hover_effect_3d.h"
 #import "image_based_light_3d.h"
 #import "input_events.h"
@@ -48,6 +50,7 @@
 #import <GameController/GameController.h>
 #import <objc/message.h>
 
+#include "extension.h"
 namespace gdrk {
 
 namespace {
@@ -59,7 +62,18 @@ typedef uint8_t (*InstanceAttachFunction)(uint8_t p_instance_id);
 InstanceGetCurrentFunction instance_get_current = nullptr;
 InstanceAttachFunction instance_attach = nullptr;
 uint8_t library_instance = 0;
-bool library_instance_alive = true;
+Class domain_host = Nil;
+SEL current_domain_token_selector = nullptr;
+SEL select_domain_token_selector = nullptr;
+uint64_t library_domain_token = 0;
+bool managed_host = false;
+std::atomic<bool> library_instance_alive{ true };
+std::atomic<uint64_t> next_scene_loader_session{ 0 };
+std::atomic<uint64_t> active_scene_loader_session{ 0 };
+std::atomic<const SceneLoader *> active_scene_loader{ nullptr };
+
+typedef uint64_t (*CurrentDomainTokenFunction)(Class, SEL);
+typedef uint64_t (*SelectDomainTokenFunction)(Class, SEL, uint64_t);
 
 } // namespace
 
@@ -75,9 +89,38 @@ bool is_host_managed() {
 }
 
 void instance_scope_setup(GDExtensionInterfaceGetProcAddress p_get_proc_address) {
-	if (!is_host_managed()) {
+	instance_get_current = nullptr;
+	instance_attach = nullptr;
+	library_instance = 0;
+	domain_host = Nil;
+	current_domain_token_selector = nullptr;
+	select_domain_token_selector = nullptr;
+	library_domain_token = 0;
+	managed_host = is_host_managed();
+	library_instance_alive.store(true, std::memory_order_release);
+	active_scene_loader_session.store(0, std::memory_order_release);
+	active_scene_loader.store(nullptr, std::memory_order_release);
+	if (!managed_host) {
 		return;
 	}
+
+	Class host = NSClassFromString(@"GDTExtensionVolume");
+	SEL current_selector = NSSelectorFromString(@"currentDomainToken");
+	SEL select_selector = NSSelectorFromString(@"selectDomainToken:");
+	if ([host respondsToSelector:current_selector] && [host respondsToSelector:select_selector]) {
+		CurrentDomainTokenFunction current_token = (CurrentDomainTokenFunction)objc_msgSend;
+		uint64_t token = current_token(host, current_selector);
+		// Zero means no engine domain is attached. Never save it as this library's domain.
+		if (token != 0) {
+			domain_host = host;
+			current_domain_token_selector = current_selector;
+			select_domain_token_selector = select_selector;
+			library_domain_token = token;
+		}
+		// A host with domain support must not fall back to an instance index.
+		return;
+	}
+
 	InstanceGetCurrentFunction get_current = (InstanceGetCurrentFunction)p_get_proc_address("instance_get_current");
 	InstanceAttachFunction attach = (InstanceAttachFunction)p_get_proc_address("instance_attach");
 	if (get_current == nullptr || attach == nullptr) {
@@ -86,19 +129,55 @@ void instance_scope_setup(GDExtensionInterfaceGetProcAddress p_get_proc_address)
 	instance_get_current = get_current;
 	instance_attach = attach;
 	library_instance = get_current();
-	library_instance_alive = true;
 }
 
 void instance_scope_shutdown() {
-	library_instance_alive = false;
+	library_instance_alive.store(false, std::memory_order_release);
+	active_scene_loader_session.store(0, std::memory_order_release);
+	active_scene_loader.store(nullptr, std::memory_order_release);
+}
+
+uint64_t activate_scene_loader(SceneLoader *p_loader) {
+	uint64_t session = next_scene_loader_session.fetch_add(1, std::memory_order_acq_rel) + 1;
+	active_scene_loader.store(p_loader, std::memory_order_release);
+	active_scene_loader_session.store(session, std::memory_order_release);
+	return session;
+}
+
+void deactivate_scene_loader(uint64_t p_session_id, SceneLoader *p_loader) {
+	if (p_session_id == 0) {
+		return;
+	}
+	uint64_t expected = p_session_id;
+	if (active_scene_loader_session.compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+		const SceneLoader *expected_loader = p_loader;
+		active_scene_loader.compare_exchange_strong(expected_loader, nullptr, std::memory_order_acq_rel);
+	}
+}
+
+bool is_scene_loader_session_active(uint64_t p_session_id, const SceneLoader *p_loader) {
+	if (p_session_id == 0 || p_loader == nullptr) {
+		return false;
+	}
+	return active_scene_loader_session.load(std::memory_order_acquire) == p_session_id &&
+			active_scene_loader.load(std::memory_order_acquire) == p_loader;
 }
 
 InstanceScope::InstanceScope() {
-	if (instance_attach == nullptr) {
+	if (!library_instance_alive.load(std::memory_order_acquire)) {
+		valid = false;
 		return;
 	}
-	if (!library_instance_alive) {
-		valid = false;
+	if (domain_host != Nil) {
+		SelectDomainTokenFunction select_token = (SelectDomainTokenFunction)objc_msgSend;
+		previous_domain_token = select_token(domain_host, select_domain_token_selector, library_domain_token);
+		CurrentDomainTokenFunction current_token = (CurrentDomainTokenFunction)objc_msgSend;
+		valid = current_token(domain_host, current_domain_token_selector) == library_domain_token;
+		restore_domain = valid;
+		return;
+	}
+	if (instance_attach == nullptr) {
+		valid = !managed_host;
 		return;
 	}
 	if (instance_get_current() == library_instance) {
@@ -109,7 +188,10 @@ InstanceScope::InstanceScope() {
 }
 
 InstanceScope::~InstanceScope() {
-	if (restore) {
+	if (restore_domain) {
+		SelectDomainTokenFunction select_token = (SelectDomainTokenFunction)objc_msgSend;
+		select_token(domain_host, select_domain_token_selector, previous_domain_token);
+	} else if (restore) {
 		instance_attach(previous_instance);
 	}
 }
@@ -142,6 +224,7 @@ void initialize_gdrk_module(godot::ModuleInitializationLevel p_level) {
 		GDREGISTER_RUNTIME_CLASS(SkeletonLoader);
 		GDREGISTER_RUNTIME_CLASS(NodeLoaders);
 		GDREGISTER_RUNTIME_CLASS(RealityControllerXRInterface);
+		GDREGISTER_CLASS(GodotRealityKit);
 		GDREGISTER_CLASS(RealityVolumeCamera3D);
 		GDREGISTER_CLASS(RealityHoverEffect3D);
 		GDREGISTER_CLASS(RealityClipping3D);
@@ -149,6 +232,7 @@ void initialize_gdrk_module(godot::ModuleInitializationLevel p_level) {
 		GDREGISTER_CLASS(RealityPortalCrossing3D);
 		GDREGISTER_CLASS(RealityImageBasedLight3D);
 		GDREGISTER_CLASS(RealityKitDirectionalLightShadow3D);
+		GDREGISTER_CLASS(RealityKitEnvironmentLightingConfiguration);
 		GDREGISTER_CLASS(InputEventSpatialTouch);
 		GDREGISTER_CLASS(InputEventSpatialDrag);
 
@@ -165,6 +249,7 @@ void initialize_gdrk_module(godot::ModuleInitializationLevel p_level) {
 
 void uninitialize_gdrk_module(godot::ModuleInitializationLevel p_level) {
 	if (p_level == godot::MODULE_INITIALIZATION_LEVEL_SCENE) {
+		GodotRealityKit::clear_preloading_materials();
 		instance_scope_shutdown();
 		reset_bridge_delegate_caches();
 	}
@@ -179,7 +264,38 @@ void main_loop_frame() {
 	}
 
 	SceneLoader *loader = reality_scene_tree->get_loader();
+
+	if (!GodotRealityKit::preloading_materials.empty()) {
+		std::vector<std::string> queued;
+		queued.swap(GodotRealityKit::preloading_materials);
+		for (const std::string &path : queued) {
+			loader->get_materials()->preload(godot::String::utf8(path.c_str()));
+		}
+	}
+
 	loader->update();
+}
+
+std::vector<std::string> GodotRealityKit::preloading_materials;
+
+void GodotRealityKit::_bind_methods() {
+	godot::ClassDB::bind_static_method("GodotRealityKit", godot::D_METHOD("preload_material", "path"), &GodotRealityKit::preload_material);
+}
+
+void GodotRealityKit::preload_material(godot::String p_path) {
+	godot::Engine *engine = godot::Engine::get_singleton();
+	if (engine != nullptr && engine->is_editor_hint()) {
+		return;
+	}
+	preloading_materials.push_back(to_std_string(p_path));
+}
+
+void GodotRealityKit::clear_preloading_materials() {
+	preloading_materials.clear();
+}
+
+void clear_preloading_materials() {
+	GodotRealityKit::clear_preloading_materials();
 }
 
 } // namespace gdrk
@@ -190,17 +306,30 @@ GDRKTransform GDRKTransform::identity = GDRKTransform{
 	.orientation = simd_quaternion(0.0f, 0.0f, 0.0f, 1.0f)
 };
 
+bool GDRKBridgeDelegate::has_active_loader() const {
+	return gdrk::is_scene_loader_session_active(session_id, loader);
+}
+
 void GDRKBridgeDelegate::printError(const char *p_msg) {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	ERR_PRINT(p_msg);
 }
 
 void GDRKBridgeDelegate::printWarning(const char *p_msg) {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	WARN_PRINT(p_msg);
 }
 
 void GDRKBridgeDelegate::printMessage(const char *p_msg) {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	godot::UtilityFunctions::print(godot::String::utf8(p_msg));
 }
@@ -226,6 +355,25 @@ bool GDRKBridgeDelegate::ExtensionSettings::should_convert_world_environment() c
 			}
 #endif
 	}
+}
+
+bool GDRKBridgeDelegate::ExtensionSettings::should_convert_skybox() const {
+	if (!should_convert_world_environment()) {
+		return false;
+	}
+
+	// Mixed/progressive immersion shows passthrough behind the scene.
+	if (presentationStyle == kImmersive && immersionStyle != kFull) {
+		return false;
+	}
+
+#if !TARGET_OS_OSX
+	if (presentationStyle == kVolumetricWindow) {
+		return false;
+	}
+#endif
+
+	return true;
 }
 
 // Cached for the engine instance that is running the game. A later instance can load this same
@@ -404,6 +552,9 @@ godot::Quaternion convert(simd_quatf value) {
 
 void GDRKBridgeDelegate::initialize_phase_manager() const {
 	godot::SceneTree *scene_tree = gdrk::get_scene_tree();
+	if (scene_tree == nullptr || scene_tree->get_root() == nullptr) {
+		return;
+	}
 
 	godot::Node *singleton = scene_tree->get_root()->get_node_or_null("PhaseManagerSingleton");
 
@@ -434,6 +585,9 @@ void GDRKBridgeDelegate::initialize_phase_manager() const {
 }
 
 void GDRKBridgeDelegate::setPHASETransform(GDRKTransform gdrk_transform) const {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	if (!phase_manager_looked_up) {
 		phase_manager_looked_up = true;
@@ -518,11 +672,17 @@ UIColor *GDRKBridgeDelegate::getBootSplashBgColor() const {
 #endif
 
 void *GDRKBridgeDelegate::getCameraEntity() const {
+	if (!has_active_loader()) {
+		return nullptr;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN(nullptr);
 	return loader->get_nodes()->get_cameras().get_current_entity().getRawPointer();
 }
 
 void GDRKBridgeDelegate::onWorldScaleChanged(float p_scale) const {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	loader->get_materials()->set_world_scale(p_scale);
 	loader->get_nodes()->get_directional_lights().set_world_scale(p_scale);
@@ -530,13 +690,27 @@ void GDRKBridgeDelegate::onWorldScaleChanged(float p_scale) const {
 	loader->get_nodes()->get_spot_lights().set_world_scale(p_scale);
 }
 
+void GDRKBridgeDelegate::onExtraLightFrustumScaleChanged(float p_scale) const {
+	if (!has_active_loader()) {
+		return;
+	}
+	GDRK_INSTANCE_SCOPE_OR_RETURN();
+	loader->get_nodes()->get_directional_lights().set_extra_light_frustum_scale(p_scale);
+}
+
 #if TARGET_OS_OSX
 void GDRKBridgeDelegate::onWindowResized(simd_float2 p_new_size) const {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	loader->set_viewport_size(godot::Vector3(p_new_size.x, p_new_size.y, 1024.0));
 }
 #else
 void GDRKBridgeDelegate::onWindowResized(simd_float3 p_new_size) const {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	loader->set_viewport_size(gdrk::from_simd3(p_new_size));
 }
@@ -555,6 +729,9 @@ void GDRKBridgeDelegate::onEntityPressUpdate(int64_t p_event_id,
 		GDRKRay p_selection_ray,
 		bool p_has_chirality,
 		uint32_t p_chirality) const {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	uint32_t cur_press_idx = 0;
 	bool is_first_press = true;
@@ -645,7 +822,7 @@ void GDRKBridgeDelegate::onEntityPressUpdate(int64_t p_event_id,
 	loader->last_active_press_position[cur_press_idx] = p_position;
 	loader->last_active_press_location[cur_press_idx] = location;
 
-	if (node) {
+	if (node && camera) {
 		loader->push_input_event(gdrk::ColliderInputEventParams{
 				.collider_id = node->get_instance_id(),
 				.camera_id = camera->get_instance_id(),
@@ -658,6 +835,9 @@ void GDRKBridgeDelegate::onEntityPressUpdate(int64_t p_event_id,
 }
 
 GDRKTransform GDRKBridgeDelegate::getXROrigin() const {
+	if (!has_active_loader()) {
+		return GDRKTransform::identity;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN(GDRKTransform::identity);
 	godot::XRServer *xr_server = godot::XRServer::get_singleton();
 	ERR_FAIL_NULL_V(xr_server, GDRKTransform::identity);
@@ -672,11 +852,17 @@ GDRKTransform GDRKBridgeDelegate::getXROrigin() const {
 }
 
 bool GDRKBridgeDelegate::wantsControllerAnchors() const {
+	if (!has_active_loader()) {
+		return false;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN(false);
 	return gdrk::RealityControllerXRInterface::get_active() != nullptr;
 }
 
 void GDRKBridgeDelegate::setControllerAnchor(ControllerHand p_hand, GDRKTransform p_transform, bool p_tracked) const {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	gdrk::RealityControllerXRInterface *controller_interface = gdrk::RealityControllerXRInterface::get_active();
 	if (controller_interface == nullptr) {
@@ -696,6 +882,9 @@ void GDRKBridgeDelegate::setControllerAnchor(ControllerHand p_hand, GDRKTransfor
 }
 
 void GDRKBridgeDelegate::setControllerInput(ControllerHand p_hand, void *p_gc_controller) const {
+	if (!has_active_loader()) {
+		return;
+	}
 	GDRK_INSTANCE_SCOPE_OR_RETURN();
 	gdrk::RealityControllerXRInterface *controller_interface = gdrk::RealityControllerXRInterface::get_active();
 	if (controller_interface == nullptr || p_gc_controller == nullptr) {

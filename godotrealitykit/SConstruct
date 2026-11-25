@@ -360,7 +360,7 @@ def assemble_full_addon(cfg):
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(ad, f))
 
-    for d in ['volume_camera_gizmo', 'directional_light_shadow_gizmo', 'clipping_gizmo']:
+    for d in ['clipping_gizmo', 'volume_camera_gizmo', 'directional_light_shadow_gizmo']:
         src = os.path.join(etc_dir, d)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(ad, d))

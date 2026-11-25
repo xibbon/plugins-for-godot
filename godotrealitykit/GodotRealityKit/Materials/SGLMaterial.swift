@@ -151,10 +151,14 @@ public class SGLProgram: @unchecked Sendable {
 					
 					let shaderGraphMaterial = try await RealityKit.ShaderGraphMaterial(named: name, from: data)
 					let loadResult = SGLMaterialLoadResult(result: shaderGraphMaterial, errorDescription: nil)
-					delegate.onCompleted(consuming: Unmanaged<SGLMaterialLoadResult>.passRetained(loadResult).toOpaque())
+					withExtendedLifetime(loadResult) {
+						delegate.onCompleted(consuming: Unmanaged<SGLMaterialLoadResult>.passUnretained(loadResult).toOpaque())
+					}
 				} catch {
 					let loadResult = SGLMaterialLoadResult(result: nil, errorDescription: "Failed to load base material: \(error)")
-					delegate.onCompleted(consuming: Unmanaged<SGLMaterialLoadResult>.passRetained(loadResult).toOpaque())
+					withExtendedLifetime(loadResult) {
+						delegate.onCompleted(consuming: Unmanaged<SGLMaterialLoadResult>.passUnretained(loadResult).toOpaque())
+					}
 				}
 			}
 		}
@@ -210,12 +214,17 @@ public class SGLProgram: @unchecked Sendable {
 		sgMaterial = nil
 	}
     
-    public func setIsBrokenMateiral(isBrokenMaterial: Bool) {
+    public func setIsBrokenMaterial(isBrokenMaterial: Bool) {
         self.isBrokenMaterial = isBrokenMaterial
     }
 	
 	public func instantiate() -> SGLMaterial {
         return SGLMaterial(program: self)
+	}
+	public func makeVariant() -> SGLProgram {
+		let variant = SGLProgram(sgMaterial)
+		// parameterBlockDescriptor intentionally not copied; finalize() will populate it
+		return variant
 	}
 	public func bindParameter(_ name: String, _ value: MaterialParameters.Value? = nil) -> UInt8 {
 		parameterBlockDescriptor.append(ParameterDescriptor(name, value))
@@ -257,15 +266,19 @@ public class SGLProgram: @unchecked Sendable {
 	public func setReadsDepth(value: Bool) {
 		sgMaterial?.readsDepth = value
 	}
-	
+
 	public func setWritesDepth(value: Bool) {
 		sgMaterial?.writesDepth = value
 	}
-	
+
 	public func setSortOrder(value: Int32) {
 		sortOrder = value
 	}
-	
+    
+	public func getSortOrder() -> Int32 {
+		return sortOrder
+	}
+    
     public func setBillboard(value: Bool) {
         billboard = value
     }
@@ -304,7 +317,7 @@ public class SGLProgram: @unchecked Sendable {
 }
 
 public class SGLMaterial: @unchecked Sendable, ReferenceHashable {
-	var program: SGLProgram? = nil
+    var program: SGLProgram? = nil
 	var value: ShaderGraphMaterial? = nil
 	var parameterBlock: SGLProgram.ParameterBlock?
 	var dirty: Bool = false

@@ -119,9 +119,12 @@ using GDRKColorRef = GDRKColor *;
 
 class GDRKBridgeDelegate {
 public:
-	explicit GDRKBridgeDelegate(gdrk::SceneLoader *p_loader) {
+	explicit GDRKBridgeDelegate(gdrk::SceneLoader *p_loader, uint64_t p_session_id = 0) {
 		loader = p_loader;
+		session_id = p_session_id;
 	}
+
+	bool has_active_loader() const;
 
 	void printError(const char *p_msg);
 	void printWarning(const char *p_msg);
@@ -142,6 +145,7 @@ public:
 		VolumeWorldAlignment volumeWorldAlignment;
 
 		bool should_convert_world_environment() const;
+		bool should_convert_skybox() const;
 	};
 
 	ExtensionSettings getExtensionSettings() const;
@@ -159,6 +163,8 @@ public:
 	void *getCameraEntity() const;
 
 	void onWorldScaleChanged(float p_scale) const;
+
+	void onExtraLightFrustumScaleChanged(float p_scale) const;
 
 #if TARGET_OS_OSX
 	void onWindowResized(simd_float2 p_new_size) const;
@@ -199,6 +205,7 @@ public:
 
 private:
 	mutable gdrk::SceneLoader *loader = nullptr;
+	uint64_t session_id = 0;
 
 	void initialize_phase_manager() const;
 };
